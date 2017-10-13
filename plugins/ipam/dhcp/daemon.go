@@ -30,13 +30,25 @@ import (
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
+	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/coreos/go-systemd/activation"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
+	"strings"
 )
 
 const listenFdsStart = 3
 const resendCount = 3
 
 var errNoMoreTries = errors.New("no more tries")
+
+type NetConf struct {
+	types.NetConf
+	IPAM struct {
+		Type string `json:"type,omitempty"`
+		Via  string `json:"via,omitempty"`
+	} `json:"ipam,omitempty"`
+}
 
 type DHCP struct {
 	mux    sync.Mutex
@@ -49,16 +61,87 @@ func newDHCP() *DHCP {
 	}
 }
 
+func parseArgs(args string) (map[string]string, error) {
+	result := map[string]string{}
+
+	if args == "" {
+		return nil, nil
+	}
+
+	pairs := strings.Split(args, ";")
+	for _, pair := range pairs {
+		kv := strings.Split(pair, "=")
+		if len(kv) != 2 || kv[0] == "" || kv[1] == "" {
+			return nil, fmt.Errorf("invalid CNI_ARGS pair %q", pair)
+		}
+
+		result[strings.ToLower(kv[0])] = kv[1]
+	}
+
+	return result, nil
+}
+
 // Allocate acquires an IP from a DHCP server for a specified container.
 // The acquired lease will be maintained until Release() is called.
 func (d *DHCP) Allocate(args *skel.CmdArgs, result *current.Result) error {
-	conf := types.NetConf{}
+	conf := NetConf{}
 	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
 		return fmt.Errorf("error parsing netconf: %v", err)
 	}
 
+	parsedArgs, err := parseArgs(args.Args)
+	if err != nil {
+		return err
+	}
+
+	var mac net.HardwareAddr
+	var client netlink.Link
+	var via netlink.Link
+	netns := args.Netns
+
+	rawMac, macSupplied := parsedArgs["mac"]
+	viaName := conf.IPAM.Via
+	viaSupplied := viaName != ""
+
+	if macSupplied != viaSupplied {
+		return fmt.Errorf("Either supply 'mac' and 'via' or none.")
+	}
+
+	// This is useful, if the target device can't reach the dhcp server directly,
+	// or if the target device creation is delayed until we have an IP address.
+	if macSupplied && viaSupplied {
+		// Use the supplied MAC instead of the MAC of args.ifName if present
+		mac, err = net.ParseMAC(rawMac)
+		if err != nil {
+			return fmt.Errorf("error parsing supplied mac: %v", err)
+		}
+
+		// If a "via" device is specified, it is looked up in the current namespace
+		netns = fmt.Sprintf("/proc/%d/task/%d/ns/net", os.Getpid(), unix.Gettid())
+		err = ns.WithNetNSPath(netns, func(_ ns.NetNS) error {
+			via, err = netlink.LinkByName(viaName)
+			if err != nil {
+				return fmt.Errorf("error looking up %q: %v", viaName, err)
+			}
+			return nil
+		})
+	} else {
+		err = ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
+			client, err = netlink.LinkByName(args.IfName)
+			if err != nil {
+				return fmt.Errorf("error looking up %q: %v", args.IfName, err)
+			}
+			mac = client.Attrs().HardwareAddr
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		via = client
+	}
+
 	clientID := args.ContainerID + "/" + conf.Name
-	l, err := AcquireLease(clientID, args.Netns, args.IfName)
+	l, err := AcquireLease(clientID, netns, via, client, mac)
 	if err != nil {
 		return err
 	}

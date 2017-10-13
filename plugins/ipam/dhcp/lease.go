@@ -49,9 +49,11 @@ const (
 
 type DHCPLease struct {
 	clientID      string
+	mac           net.HardwareAddr
 	ack           *dhcp4.Packet
 	opts          dhcp4.Options
-	link          netlink.Link
+	viaLink       netlink.Link
+	clientLink    netlink.Link
 	renewalTime   time.Time
 	rebindingTime time.Time
 	expireTime    time.Time
@@ -62,11 +64,14 @@ type DHCPLease struct {
 // AcquireLease gets an DHCP lease and then maintains it in the background
 // by periodically renewing it. The acquired lease can be released by
 // calling DHCPLease.Stop()
-func AcquireLease(clientID, netns, ifName string) (*DHCPLease, error) {
+func AcquireLease(clientID, netns string, viaLink netlink.Link, clientLink netlink.Link, mac net.HardwareAddr) (*DHCPLease, error) {
 	errCh := make(chan error, 1)
 	l := &DHCPLease{
-		clientID: clientID,
-		stop:     make(chan struct{}),
+		mac:        mac,
+		clientID:   clientID,
+		stop:       make(chan struct{}),
+		viaLink:    viaLink,
+		clientLink: clientLink,
 	}
 
 	log.Printf("%v: acquiring lease", clientID)
@@ -76,14 +81,7 @@ func AcquireLease(clientID, netns, ifName string) (*DHCPLease, error) {
 		errCh <- ns.WithNetNSPath(netns, func(_ ns.NetNS) error {
 			defer l.wg.Done()
 
-			link, err := netlink.LinkByName(ifName)
-			if err != nil {
-				return fmt.Errorf("error looking up %q: %v", ifName, err)
-			}
-
-			l.link = link
-
-			if err = l.acquire(); err != nil {
+			if err := l.acquire(); err != nil {
 				return err
 			}
 
@@ -111,15 +109,15 @@ func (l *DHCPLease) Stop() {
 }
 
 func (l *DHCPLease) acquire() error {
-	c, err := newDHCPClient(l.link)
+	c, err := newDHCPClient(l.viaLink, l.mac)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
 
-	if (l.link.Attrs().Flags & net.FlagUp) != net.FlagUp {
-		log.Printf("Link %q down. Attempting to set up", l.link.Attrs().Name)
-		if err = netlink.LinkSetUp(l.link); err != nil {
+	if l.clientLink != nil && (l.clientLink.Attrs().Flags&net.FlagUp) != net.FlagUp {
+		log.Printf("Link %q down. Attempting to set up", l.clientLink.Attrs().Name)
+		if err = netlink.LinkSetUp(l.clientLink); err != nil {
 			return err
 		}
 	}
@@ -228,13 +226,16 @@ func (l *DHCPLease) maintain() {
 }
 
 func (l *DHCPLease) downIface() {
-	if err := netlink.LinkSetDown(l.link); err != nil {
-		log.Printf("%v: failed to bring %v interface DOWN: %v", l.clientID, l.link.Attrs().Name, err)
+	if l.clientLink == nil {
+		return
+	}
+	if err := netlink.LinkSetDown(l.clientLink); err != nil {
+		log.Printf("%v: failed to bring %v interface DOWN: %v", l.clientID, l.clientLink.Attrs().Name, err)
 	}
 }
 
 func (l *DHCPLease) renew() error {
-	c, err := newDHCPClient(l.link)
+	c, err := newDHCPClient(l.viaLink, l.mac)
 	if err != nil {
 		return err
 	}
@@ -262,7 +263,7 @@ func (l *DHCPLease) renew() error {
 func (l *DHCPLease) release() error {
 	log.Printf("%v: releasing lease", l.clientID)
 
-	c, err := newDHCPClient(l.link)
+	c, err := newDHCPClient(l.viaLink, l.mac)
 	if err != nil {
 		return err
 	}
@@ -322,14 +323,14 @@ func backoffRetry(f func() (*dhcp4.Packet, error)) (*dhcp4.Packet, error) {
 	return nil, errNoMoreTries
 }
 
-func newDHCPClient(link netlink.Link) (*dhcp4client.Client, error) {
+func newDHCPClient(link netlink.Link, mac net.HardwareAddr) (*dhcp4client.Client, error) {
 	pktsock, err := dhcp4client.NewPacketSock(link.Attrs().Index)
 	if err != nil {
 		return nil, err
 	}
 
 	return dhcp4client.New(
-		dhcp4client.HardwareAddr(link.Attrs().HardwareAddr),
+		dhcp4client.HardwareAddr(mac),
 		dhcp4client.Timeout(5*time.Second),
 		dhcp4client.Broadcast(false),
 		dhcp4client.Connection(pktsock),
